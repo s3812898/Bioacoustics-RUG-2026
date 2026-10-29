@@ -48,11 +48,8 @@ for (p in packages) {
 
 
 # 2. USER SETTINGS --------------------------------------------
-
-project_folder <- paste0(
-  "/Users/bramstek/Documents/University/BCN/",
-  "Neural_Mechanisms_of_Sensory_Learning"
-)
+# ADD FOLDER PATH
+project_folder <- paste0()
 
 data_folder <- file.path(project_folder, "Results")
 output_folder <- data_folder
