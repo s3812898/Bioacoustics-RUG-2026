@@ -1,0 +1,1062 @@
+
+# =============================================================
+# CRICKET HARMONICS VS TEMPERATURE - REPEATED RECORDINGS
+# Species: Plebeiogryllus guttiventris
+#
+# LINEAR MIXED-EFFECTS MODELS:
+# H2 amplitude (dB) ~ Temperature + (1 | CricketID)
+# H3 amplitude (dB) ~ Temperature + (1 | CricketID)
+#
+# Uses one median H2/H3 measurement per recording.
+# Multiple recordings from the same cricket are accounted for.
+#
+# GRAPH DESIGN:
+# Blue points   = Individual measurements
+# Orange points = Recording medians
+# Green line    = Mixed-model fit
+# Shaded area   = 95% confidence interval
+#
+# =============================================================
+
+
+# 1. PACKAGES -------------------------------------------------
+
+packages <- c(
+  "readxl",
+  "dplyr",
+  "tidyr",
+  "ggplot2",
+  "lmerTest"
+)
+
+missing_packages <- packages[
+  !vapply(
+    packages,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
+]
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages)
+}
+
+for (p in packages) {
+  library(p, character.only = TRUE)
+}
+
+
+# 2. USER SETTINGS --------------------------------------------
+
+project_folder <- paste0(
+  "/Users/bramstek/Documents/University/BCN/",
+  "Neural_Mechanisms_of_Sensory_Learning"
+)
+
+data_folder <- file.path(project_folder, "Results")
+output_folder <- data_folder
+
+harmonics_filename <- "Individual_Cricket_Harmonics.csv"
+temperature_filename <- "recording_temperature_data.xlsx"
+
+# Reproduce whole-recording 1% MATLAB exclusion if needed.
+apply_1percent_rule_in_R <- TRUE
+min_relative_amplitude <- 0.01
+
+# Optional fixed-effect sensitivity analysis.
+run_cricket_fixed_effect_model <- TRUE
+
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder, recursive = TRUE)
+}
+
+
+# 3. FIND AND LOAD FILES --------------------------------------
+
+first_existing <- function(paths, description) {
+
+  found <- paths[file.exists(paths)]
+
+  if (!length(found)) {
+    stop(
+      description, " not found. Checked:\n",
+      paste(paths, collapse = "\n")
+    )
+  }
+
+  found[1]
+}
+
+harmonics_file <- first_existing(
+  c(
+    file.path(data_folder, harmonics_filename),
+    file.path(
+      project_folder, "Audio_files", "Clips",
+      harmonics_filename
+    ),
+    file.path(
+      project_folder, "Audio_files", "Trimmed_clips",
+      harmonics_filename
+    )
+  ),
+  "Harmonics CSV"
+)
+
+temperature_file <- first_existing(
+  c(
+    file.path(data_folder, temperature_filename),
+    file.path(
+      data_folder, "recording_temperature_data(2).xlsx"
+    ),
+    file.path(
+      data_folder, "recording_temperature_data(1).xlsx"
+    )
+  ),
+  "Temperature Excel file"
+)
+
+harmonics <- read.csv(
+  harmonics_file,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+temps <- readxl::read_excel(temperature_file)
+
+required_h <- c(
+  "File",
+  "H2_RelativeAmplitude",
+  "H3_RelativeAmplitude"
+)
+
+if (!all(required_h %in% names(harmonics))) {
+  stop(
+    "Harmonics CSV missing: ",
+    paste(
+      setdiff(required_h, names(harmonics)),
+      collapse = ", "
+    )
+  )
+}
+
+if (!all(c("Audio", "Temperature") %in% names(temps))) {
+  stop(
+    "Excel must contain columns named Audio and Temperature."
+  )
+}
+
+
+# 4. RECORDING IDs AND CRICKET IDs ----------------------------
+
+standardize_id <- function(x) {
+
+  x <- trimws(as.character(x))
+  x <- sub("\\.[Ww][Aa][Vv]$", "", x)
+  x <- sub("_[Cc]$", "", x)
+
+  x
+}
+
+harmonics <- harmonics %>%
+  mutate(
+    RecordingID = standardize_id(File),
+    CricketID = sub("_.*$", "", RecordingID),
+
+    H2_RelativeAmplitude =
+      suppressWarnings(as.numeric(H2_RelativeAmplitude)),
+
+    H3_RelativeAmplitude =
+      suppressWarnings(as.numeric(H3_RelativeAmplitude))
+  )
+
+temps <- temps %>%
+  transmute(
+    RecordingID = standardize_id(Audio),
+    Temperature = suppressWarnings(as.numeric(Temperature))
+  ) %>%
+  filter(!is.na(RecordingID), nzchar(RecordingID))
+
+if (any(!grepl("^[A-Za-z]{3}$", harmonics$CricketID))) {
+  stop(
+    "Some CricketID values are not three letters. ",
+    "Check filename parsing."
+  )
+}
+
+
+# 5. EXCLUDE UNRELIABLE RECORDINGS ----------------------------
+
+manual_exclusions <- c(
+  "KPP_n3_2",
+  "PAS_n3_1",
+  "SAB_n3_1",
+  "SBA_2",
+  "SKL_3",
+  "PAS_n2_1",
+  "SAB_n1_1",
+  "SAB_2"
+)
+
+duplicated_temp_ids <- temps %>%
+  count(RecordingID) %>%
+  filter(n > 1) %>%
+  pull(RecordingID)
+
+missing_temp_ids <- temps %>%
+  filter(!is.finite(Temperature)) %>%
+  pull(RecordingID)
+
+unmatched_ids <- setdiff(
+  unique(harmonics$RecordingID),
+  temps$RecordingID
+)
+
+weak_ids <- character()
+
+if (apply_1percent_rule_in_R) {
+
+  weak_rows <- with(
+    harmonics,
+
+    is.finite(H2_RelativeAmplitude) &
+      is.finite(H3_RelativeAmplitude) &
+
+      H2_RelativeAmplitude >= 0 &
+      H3_RelativeAmplitude >= 0 &
+
+      H2_RelativeAmplitude < min_relative_amplitude &
+      H3_RelativeAmplitude < min_relative_amplitude
+  )
+
+  weak_ids <- unique(harmonics$RecordingID[weak_rows])
+}
+
+excluded_ids <- unique(
+  c(
+    manual_exclusions,
+    duplicated_temp_ids,
+    missing_temp_ids,
+    unmatched_ids,
+    weak_ids
+  )
+)
+
+present_exclusions <- intersect(
+  unique(harmonics$RecordingID),
+  excluded_ids
+)
+
+exclusions <- data.frame(
+  RecordingID = sort(present_exclusions)
+)
+
+exclusions$Reason <- vapply(
+  exclusions$RecordingID,
+
+  function(id) {
+
+    reason <- character()
+
+    if (id %in% manual_exclusions) {
+      reason <- c(reason, "Previously unverified ID")
+    }
+
+    if (id %in% duplicated_temp_ids) {
+      reason <- c(reason, "Duplicate temperature")
+    }
+
+    if (id %in% missing_temp_ids) {
+      reason <- c(reason, "Missing temperature")
+    }
+
+    if (id %in% unmatched_ids) {
+      reason <- c(reason, "No exact temperature match")
+    }
+
+    if (id %in% weak_ids) {
+      reason <- c(
+        reason, "Both H2 and H3 < 1% in a sample"
+      )
+    }
+
+    paste(reason, collapse = "; ")
+  },
+
+  character(1)
+)
+
+write.csv(
+  exclusions,
+  file.path(
+    output_folder, "Harmonics_Excluded_RecordingIDs.csv"
+  ),
+  row.names = FALSE
+)
+
+valid_temps <- temps %>%
+  filter(
+    !RecordingID %in% excluded_ids,
+    is.finite(Temperature)
+  )
+
+joined <- harmonics %>%
+  filter(!RecordingID %in% excluded_ids) %>%
+  inner_join(valid_temps, by = "RecordingID")
+
+if (!nrow(joined)) {
+  stop("No valid recordings after exclusions.")
+}
+
+
+# 6. CALCULATE RECORDING MEDIANS ------------------------------
+
+individual <- joined %>%
+  select(
+    RecordingID,
+    CricketID,
+    File,
+    Temperature,
+    any_of("ChirpNumber"),
+    H2_RelativeAmplitude,
+    H3_RelativeAmplitude
+  ) %>%
+  pivot_longer(
+    cols = c(
+      H2_RelativeAmplitude,
+      H3_RelativeAmplitude
+    ),
+    names_to = "Harmonic",
+    values_to = "RelativeAmplitude"
+  ) %>%
+  mutate(
+    Harmonic = recode(
+      Harmonic,
+      H2_RelativeAmplitude = "H2",
+      H3_RelativeAmplitude = "H3"
+    ),
+
+    RelativeAmplitude_dB =
+      20 * log10(RelativeAmplitude)
+  ) %>%
+  filter(
+    is.finite(RelativeAmplitude),
+    RelativeAmplitude > 0,
+    is.finite(RelativeAmplitude_dB)
+  ) %>%
+  mutate(
+    Harmonic = factor(
+      Harmonic,
+      levels = c("H2", "H3")
+    )
+  )
+
+recording_summary <- individual %>%
+  group_by(
+    RecordingID,
+    CricketID,
+    Temperature,
+    Harmonic
+  ) %>%
+  summarise(
+    N_SpectralSamples = n(),
+    Median_dB = median(RelativeAmplitude_dB),
+    Median_Ratio = median(RelativeAmplitude),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    CricketID = factor(CricketID)
+  )
+
+
+# One row per recording for JASP.
+
+jasp_ready <- recording_summary %>%
+  select(
+    RecordingID,
+    CricketID,
+    Temperature,
+    Harmonic,
+    Median_dB,
+    N_SpectralSamples
+  ) %>%
+  pivot_wider(
+    names_from = Harmonic,
+    values_from = c(Median_dB, N_SpectralSamples),
+    names_glue = "{.value}_{Harmonic}"
+  ) %>%
+  arrange(CricketID, RecordingID)
+
+write.csv(
+  jasp_ready,
+  file.path(
+    output_folder, "Harmonics_JASP_RecordingLevel.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  recording_summary,
+  file.path(
+    output_folder, "Harmonics_RecordingMedians_Long.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  individual,
+  file.path(
+    output_folder, "Harmonics_Individual_Valid.csv"
+  ),
+  row.names = FALSE
+)
+
+cat(
+  "\nRetained recordings:",
+  n_distinct(jasp_ready$RecordingID), "\n"
+)
+
+cat(
+  "Individual crickets:",
+  n_distinct(jasp_ready$CricketID), "\n"
+)
+
+cat(
+  "Excluded recordings:",
+  nrow(exclusions), "\n"
+)
+
+
+# 7. LINEAR MIXED-EFFECTS MODELS ------------------------------
+
+model_results <- list()
+prediction_results <- list()
+model_objects <- list()
+fixed_effect_results <- list()
+
+for (h in c("H2", "H3")) {
+
+  ds <- recording_summary %>%
+    filter(Harmonic == h) %>%
+    mutate(
+      CricketID = droplevels(CricketID)
+    )
+
+  if (
+    n_distinct(ds$CricketID) < 2 ||
+    n_distinct(ds$Temperature) < 2
+  ) {
+    warning(
+      "Not enough crickets/temperatures for model ", h
+    )
+    next
+  }
+
+  mixed <- lmerTest::lmer(
+    Median_dB ~ Temperature + (1 | CricketID),
+    data = ds,
+    REML = TRUE
+  )
+
+  model_objects[[h]] <- mixed
+
+  tab <- coef(summary(mixed))
+
+  b <- unname(
+    tab["Temperature", "Estimate"]
+  )
+
+  se <- unname(
+    tab["Temperature", "Std. Error"]
+  )
+
+  model_results[[h]] <- data.frame(
+    Harmonic = h,
+    N_Recordings = nrow(ds),
+    N_Crickets = n_distinct(ds$CricketID),
+    Slope_dB_per_C = b,
+    StdError = se,
+    DegreesFreedom = unname(
+      tab["Temperature", "df"]
+    ),
+    t_value = unname(
+      tab["Temperature", "t value"]
+    ),
+    p_value = unname(
+      tab["Temperature", "Pr(>|t|)"]
+    ),
+    CI95_Lower = b - 1.96 * se,
+    CI95_Upper = b + 1.96 * se,
+    SingularFit = lme4::isSingular(mixed)
+  )
+
+
+  # Fixed-effect predictions and approximate 95% CI.
+
+  newdata <- data.frame(
+    Temperature = seq(
+      min(ds$Temperature),
+      max(ds$Temperature),
+      length.out = 100
+    )
+  )
+
+  X <- model.matrix(
+    ~ Temperature,
+    data = newdata
+  )
+
+  fe <- lme4::fixef(mixed)
+  V <- as.matrix(vcov(mixed))
+
+  fitted <- as.vector(X %*% fe)
+
+  fitted_se <- sqrt(
+    rowSums((X %*% V) * X)
+  )
+
+  prediction_results[[h]] <- data.frame(
+    Harmonic = h,
+    Temperature = newdata$Temperature,
+    Fitted_dB = fitted,
+    Lower95 = fitted - 1.96 * fitted_se,
+    Upper95 = fitted + 1.96 * fitted_se
+  )
+
+
+  # Optional cricket fixed-effects sensitivity analysis.
+
+  if (run_cricket_fixed_effect_model) {
+
+    fixed <- lm(
+      Median_dB ~ Temperature + CricketID,
+      data = ds
+    )
+
+    ct <- coef(summary(fixed))
+
+    if ("Temperature" %in% rownames(ct)) {
+
+      fixed_effect_results[[h]] <- data.frame(
+        Harmonic = h,
+        Slope_dB_per_C =
+          ct["Temperature", "Estimate"],
+        StdError =
+          ct["Temperature", "Std. Error"],
+        p_value =
+          ct["Temperature", "Pr(>|t|)"]
+      )
+    }
+  }
+
+  cat("\n=======", h, "MIXED MODEL =======\n")
+
+  print(summary(mixed))
+
+  if (lme4::isSingular(mixed)) {
+    warning(
+      h,
+      " random-effect variance is near zero."
+    )
+  }
+}
+
+if (!length(model_results)) {
+  stop("Neither mixed model could be fitted.")
+}
+
+results <- dplyr::bind_rows(model_results)
+
+predictions <- dplyr::bind_rows(prediction_results)
+
+write.csv(
+  results,
+  file.path(
+    output_folder, "Harmonics_MixedModel_Results.csv"
+  ),
+  row.names = FALSE
+)
+
+if (length(fixed_effect_results)) {
+
+  write.csv(
+    dplyr::bind_rows(fixed_effect_results),
+    file.path(
+      output_folder,
+      "Harmonics_CricketFixedEffect_Check.csv"
+    ),
+    row.names = FALSE
+  )
+}
+
+cat(
+  "\n======= MIXED MODEL TEMPERATURE SLOPES =======\n"
+)
+
+print(results)
+
+
+# 8. FIGURE DESIGN --------------------------------------------
+
+# Only graph styling changes from this point onward.
+#
+# Blue points   = Individual spectral measurements
+# Orange points = Recording medians
+# Green line    = Population-level mixed-model fit
+# Green shading = Approximate 95% CI for fitted mean
+#
+# The CI does not describe the distribution of individual
+# observations.
+
+
+# ------------------------------------------------------------
+# COLOUR PALETTE
+# ------------------------------------------------------------
+
+plot_colours <- c(
+  "Individual measurements" = "#0072B2",
+  "Recording medians" = "#D55E00",
+  "Mixed-model fit" = "#009E73"
+)
+
+band_colour <- c(
+  "95% confidence interval" = "#A6DCCB"
+)
+
+
+# ------------------------------------------------------------
+# COMMON GRAPH THEME
+# ------------------------------------------------------------
+
+scientific_theme <- theme_classic(base_size = 13) +
+  theme(
+
+    # Centered main title
+
+    plot.title = element_text(
+      face = "bold",
+      size = 17,
+      hjust = 0.5,
+      margin = margin(b = 13)
+    ),
+
+    plot.title.position = "plot",
+
+
+    # Axis titles
+
+    axis.title.x = element_text(
+      size = 12,
+      margin = margin(t = 11),
+      hjust = 0.5
+    ),
+
+    axis.title.y = element_text(
+      size = 12,
+      margin = margin(r = 11)
+    ),
+
+    axis.text = element_text(
+      size = 11,
+      colour = "#333333"
+    ),
+
+    axis.ticks = element_line(
+      colour = "#4B5563",
+      linewidth = 0.35
+    ),
+
+    axis.line = element_line(
+      colour = "#4B5563",
+      linewidth = 0.45
+    ),
+
+
+    # Minimal, light horizontal gridlines
+
+    panel.grid.major.y = element_line(
+      colour = "#EBEDF0",
+      linewidth = 0.3
+    ),
+
+    panel.grid.major.x = element_blank(),
+
+    panel.grid.minor = element_blank(),
+
+    panel.spacing = grid::unit(1.2, "lines"),
+
+
+    # H2 and H3 panel labels
+
+    strip.background = element_rect(
+      fill = "#F3F4F6",
+      colour = NA
+    ),
+
+    strip.text = element_text(
+      face = "bold",
+      size = 12
+    ),
+
+
+    # Legend above the graph
+
+    legend.position = "top",
+
+    legend.direction = "horizontal",
+
+    legend.box = "horizontal",
+
+    legend.justification = "center",
+
+    legend.box.just = "center",
+
+    legend.title = element_blank(),
+
+    legend.text = element_text(
+      size = 10.5
+    ),
+
+    legend.key = element_rect(
+      fill = "white",
+      colour = NA
+    ),
+
+    legend.key.width =
+      grid::unit(1.3, "lines"),
+
+    legend.key.height =
+      grid::unit(1.0, "lines"),
+
+    legend.spacing.x =
+      grid::unit(0.55, "lines"),
+
+    legend.box.margin = margin(b = 5),
+
+
+    # White margins around the figure
+
+    plot.margin = margin(
+      12, 16, 10, 14
+    )
+  )
+
+
+# ------------------------------------------------------------
+# LEGEND AND AXIS SCALES
+# ------------------------------------------------------------
+
+# The legend uses actual symbols from the plotted objects:
+# - geom_point -> circles
+# - geom_line -> line
+# - geom_ribbon -> shaded rectangle
+
+figure_scales <- list(
+
+  scale_colour_manual(
+    values = plot_colours,
+    breaks = names(plot_colours),
+    name = NULL
+  ),
+
+  scale_fill_manual(
+    values = band_colour,
+    breaks = names(band_colour),
+    name = NULL
+  ),
+
+  # Readable temperature tick spacing.
+
+  scale_x_continuous(
+    breaks = scales::breaks_pretty(n = 6),
+    expand = expansion(
+      mult = c(0.025, 0.025)
+    )
+  ),
+
+  # Readable dB tick spacing.
+  # Do not force the y-axis to start at zero.
+
+  scale_y_continuous(
+    breaks = scales::breaks_pretty(n = 6),
+    expand = expansion(
+      mult = c(0.04, 0.06)
+    )
+  ),
+
+  guides(
+
+    colour = guide_legend(
+      order = 1,
+      nrow = 1,
+      override.aes = list(alpha = 1)
+    ),
+
+    fill = guide_legend(
+      order = 2,
+      nrow = 1
+    )
+  )
+)
+
+
+# 9. FIGURE 1: ONE MEDIAN PER RECORDING -----------------------
+
+figure1 <- ggplot() +
+
+  # Shaded 95% confidence interval.
+
+  geom_ribbon(
+    data = predictions,
+    aes(
+      x = Temperature,
+      ymin = Lower95,
+      ymax = Upper95,
+      fill = "95% confidence interval"
+    ),
+    alpha = 0.40
+  ) +
+
+  # Mixed-model fitted regression line.
+
+  geom_line(
+    data = predictions,
+    aes(
+      x = Temperature,
+      y = Fitted_dB,
+      colour = "Mixed-model fit"
+    ),
+    linewidth = 1.1
+  ) +
+
+  # Orange recording-level medians.
+
+  geom_point(
+    data = recording_summary,
+    aes(
+      x = Temperature,
+      y = Median_dB,
+      colour = "Recording medians"
+    ),
+    size = 2.3,
+    alpha = 0.90
+  ) +
+
+  # Separate panels for H2 and H3.
+
+  facet_wrap(
+    ~ Harmonic,
+    nrow = 1
+  ) +
+
+  # Correct title and axis labels.
+
+  labs(
+    title = "Temperature vs Harmonic Amplitude",
+    x = "Recording temperature (\u00B0C)",
+    y = "Harmonic amplitude relative to $f_o$ (dB)"
+  ) +
+
+  figure_scales +
+
+  scientific_theme
+
+
+# 10. FIGURE 2: ALL INDIVIDUAL MEASUREMENTS -------------------
+
+# Individual measurements are shown for visualization.
+# They are not treated as independent recording-level
+# observations in the mixed model.
+#
+# Horizontal jitter reduces overlapping blue points.
+# It does not alter the data used for statistical analysis.
+
+figure2 <- ggplot() +
+
+  # Shaded confidence interval.
+
+  geom_ribbon(
+    data = predictions,
+    aes(
+      x = Temperature,
+      ymin = Lower95,
+      ymax = Upper95,
+      fill = "95% confidence interval"
+    ),
+    alpha = 0.40
+  ) +
+
+  # Individual spectral measurements (blue).
+
+  geom_point(
+    data = individual,
+    aes(
+      x = Temperature,
+      y = RelativeAmplitude_dB,
+      colour = "Individual measurements"
+    ),
+    position = position_jitter(
+      width = 0.06,
+      height = 0,
+      seed = 421
+    ),
+    size = 0.75,
+    alpha = 0.13
+  ) +
+
+  # Population-level mixed-model regression line.
+
+  geom_line(
+    data = predictions,
+    aes(
+      x = Temperature,
+      y = Fitted_dB,
+      colour = "Mixed-model fit"
+    ),
+    linewidth = 1.1
+  ) +
+
+  # Recording medians (orange).
+
+  geom_point(
+    data = recording_summary,
+    aes(
+      x = Temperature,
+      y = Median_dB,
+      colour = "Recording medians"
+    ),
+    size = 2.0,
+    alpha = 0.91
+  ) +
+
+  facet_wrap(
+    ~ Harmonic,
+    nrow = 1
+  ) +
+
+  labs(
+    title = "Temperature vs Harmonic Amplitude",
+    x = "Recording temperature (°C)",
+    y = "Harmonic amplitude relative to $f_o$ (dB)"
+  ) +
+
+  figure_scales +
+
+  scientific_theme
+
+
+# 11. CHECK FIGURES BEFORE EXPORT -----------------------------
+
+# Automatically detect missing results, invalid predictions,
+# incorrect graph titles and graphical build errors.
+
+stopifnot(
+  nrow(recording_summary) > 0L,
+  nrow(individual) > 0L,
+  nrow(predictions) > 0L,
+
+  all(is.finite(predictions$Fitted_dB)),
+
+  all(is.finite(predictions$Lower95)),
+
+  all(is.finite(predictions$Upper95)),
+
+  all(
+    predictions$Lower95 <= predictions$Upper95
+  ),
+
+  identical(
+    figure1$labels$title,
+    "Temperature vs Harmonic Amplitude"
+  ),
+
+  identical(
+    figure2$labels$title,
+    "Temperature vs Harmonic Amplitude"
+  )
+)
+
+# Build graphical objects, including the legends.
+# This catches many ggplot errors before saving.
+
+invisible(
+  ggplot2::ggplotGrob(figure1)
+)
+
+invisible(
+  ggplot2::ggplotGrob(figure2)
+)
+
+
+# 12. DISPLAY FIGURES -----------------------------------------
+
+print(figure1)
+
+print(figure2)
+
+
+# 13. EXPORT PNG AND PDF FIGURES ------------------------------
+
+files_to_write <- c(
+  "Figure1_Harmonics_MixedModel.png",
+  "Figure2_Harmonics_MixedModel_Individual.png",
+  "Figure1_Harmonics_MixedModel.pdf",
+  "Figure2_Harmonics_MixedModel_Individual.pdf"
+)
+
+plots_to_write <- list(
+  figure1,
+  figure2,
+  figure1,
+  figure2
+)
+
+for (i in seq_along(files_to_write)) {
+
+  file_path <- file.path(
+    output_folder,
+    files_to_write[i]
+  )
+
+  ggplot2::ggsave(
+    filename = file_path,
+    plot = plots_to_write[[i]],
+    width = 12,
+    height = 5.5,
+    dpi = 300,
+    bg = "white"
+  )
+}
+
+
+# 14. CHECK EXPORTED FILES ------------------------------------
+
+export_paths <- file.path(
+  output_folder,
+  files_to_write
+)
+
+if (
+  !all(file.exists(export_paths)) ||
+  any(file.info(export_paths)$size <= 0)
+) {
+  stop(
+    "A figure export is missing or empty. ",
+    "Check the output folder."
+  )
+}
+
+cat(
+  "\nAll figure files exported and checked:\n"
+)
+
+cat(
+  paste(" -", export_paths, collapse = "\n"),
+  "\n"
+)
+
+cat(
+  "\nDONE. Results and JASP-ready CSV are in:\n",
+  output_folder,
+  "\n"
+)
