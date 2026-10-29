@@ -1,0 +1,359 @@
+
+# ============================================================
+# CRICKET BIOACOUSTICS - CHIRP GAP VS TEMPERATURE
+# Plebeiogryllus guttiventris | R / RStudio
+#
+# Fits a linear mixed-effects model to the MEAN chirp gap
+# of each recording, with a random intercept for CricketID.
+# Also reports ordinary linear regression / Pearson r for
+# descriptive comparison (NOT the main inferential analysis).
+#
+# Figures:
+# 1. Mean gap by recording + LMM fitted line + approx. 95% CI
+# 2. Individual gaps + recording means + LMM fit, two panels
+#
+# Output files are automatically saved into data_folder.
+# ============================================================
+
+# 1. PACKAGES ------------------------------------------------
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+packages <- c("ggplot2", "dplyr", "readxl", "patchwork", "lmerTest")
+missing_packages <- packages[!vapply(packages, requireNamespace,
+                                      logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) install.packages(missing_packages)
+
+library(ggplot2)
+library(dplyr)
+library(readxl)
+library(patchwork)
+library(lmerTest)
+
+# 2. DATA FILES -----------------------------------------------
+data_folder <- paste0(
+  "/Users/bramstek/Documents/University/BCN/",
+  "Neural_Mechanisms_of_Sensory_Learning/Results"
+)
+
+gap_file <- file.path(data_folder, "Individual_Chirp_Gaps_WithinCalls.csv")
+temp_file <- file.path(data_folder, "recording_temperature_data.xlsx")
+
+if (!file.exists(gap_file)) stop("Chirp gap CSV not found: ", gap_file)
+if (!file.exists(temp_file)) stop("Temperature Excel not found: ", temp_file)
+
+gaps <- read.csv(gap_file, stringsAsFactors = FALSE)
+temps <- read_excel(temp_file)
+
+if (!all(c("File", "ChirpGap_milliseconds") %in% names(gaps))) {
+  stop("Gap CSV must contain File and ChirpGap_milliseconds.")
+}
+if (!all(c("Audio", "Temperature") %in% names(temps))) {
+  stop("Excel file must contain Audio and Temperature.")
+}
+
+# 3. CLEAN RECORDING IDENTIFIERS ------------------------------
+# Example: APP_1_C.wav -> APP_1 -> cricket APP
+# Do not guess or correct uncertain recording names.
+standardize_id <- function(x) {
+  x <- trimws(as.character(x))
+  x <- sub("\\.[Ww][Aa][Vv]$", "", x)
+  sub("_[Cc]$", "", x)
+}
+
+gaps <- gaps %>% mutate(
+  RecordingID = standardize_id(File),
+  ChirpGap_ms = suppressWarnings(as.numeric(ChirpGap_milliseconds))
+)
+
+temps <- temps %>% transmute(
+  RecordingID = standardize_id(Audio),
+  Temperature = suppressWarnings(as.numeric(Temperature))
+)
+
+# 4. IDENTIFY UNRELIABLE RECORDING IDS ------------------------
+# Preserve the exclusion logic of the original plotter:
+# duplicate temperature entries, missing temperatures,
+# or recording IDs without an exact match.
+duplicate_ids <- temps %>%
+  count(RecordingID, name = "N") %>%
+  filter(N > 1) %>%
+  pull(RecordingID)
+
+unmatched_ids <- setdiff(unique(gaps$RecordingID), temps$RecordingID)
+
+missing_temp_ids <- temps %>%
+  filter(!is.finite(Temperature)) %>%
+  pull(RecordingID)
+
+# Explicitly keep the previously identified unreliable IDs
+# excluded even if a future spreadsheet appears to match them.
+# Set to character(0) only after independently verifying them.
+previously_unverified_ids <- c(
+  "KPP_n3_2", "PAS_n3_1", "SAB_n3_1", "SBA_2", "SKL_3",
+  "PAS_n2_1", "SAB_n1_1", "SAB_2"
+)
+
+excluded_ids <- unique(c(duplicate_ids, unmatched_ids,
+                         missing_temp_ids, previously_unverified_ids))
+excluded_ids <- intersect(unique(gaps$RecordingID), excluded_ids)
+
+exclusion_table <- data.frame(
+  RecordingID = sort(excluded_ids),
+  stringsAsFactors = FALSE
+)
+exclusion_table$Reason <- vapply(exclusion_table$RecordingID, function(id) {
+  reasons <- character(0)
+  if (id %in% duplicate_ids) reasons <- c(reasons, "Duplicate temperature row")
+  if (id %in% unmatched_ids) reasons <- c(reasons, "No exact temperature ID match")
+  if (id %in% missing_temp_ids) reasons <- c(reasons, "Missing temperature")
+  if (id %in% previously_unverified_ids) reasons <- c(reasons, "Previously unverified recording")
+  paste(reasons, collapse = "; ")
+}, character(1))
+
+write.csv(exclusion_table,
+          file.path(data_folder, "Excluded_Recordings.csv"),
+          row.names = FALSE)
+
+# 5. MATCH GAPS TO RELIABLE TEMPERATURES ----------------------
+valid_temps <- temps %>%
+  filter(!RecordingID %in% excluded_ids, is.finite(Temperature)) %>%
+  distinct(RecordingID, .keep_all = TRUE)
+
+data <- gaps %>%
+  filter(!RecordingID %in% excluded_ids) %>%
+  inner_join(valid_temps, by = "RecordingID") %>%
+  filter(is.finite(ChirpGap_ms), is.finite(Temperature)) %>%
+  mutate(
+    CricketID = sub("_.*$", "", RecordingID),
+    CricketID = factor(CricketID)
+  )
+
+if (!nrow(data)) stop("No matched gaps remain after cleaning.")
+
+# Verify IDs before trusting cricket-level grouping.
+invalid_cricket_id <- !grepl("^[A-Za-z]{3}$", as.character(data$CricketID))
+if (any(invalid_cricket_id)) {
+  stop("Unexpected cricket identifiers: ",
+       paste(unique(as.character(data$CricketID[invalid_cricket_id])),
+             collapse = ", "))
+}
+
+# 6. ONE AVERAGE PER RECORDING -------------------------------
+# Each recording carries one measured temperature.
+# CricketID connects repeat recordings from the same animal.
+recording_means <- data %>%
+  group_by(RecordingID, CricketID, Temperature) %>%
+  summarise(
+    MeanGap_ms = mean(ChirpGap_ms),
+    MedianGap_ms = median(ChirpGap_ms),
+    SDGap_ms = sd(ChirpGap_ms),
+    N_Gaps = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(CricketID = droplevels(CricketID))
+
+if (n_distinct(recording_means$CricketID) < 2 ||
+    n_distinct(recording_means$Temperature) < 2) {
+  stop("Not enough crickets or temperature variation for the mixed model.")
+}
+
+write.csv(recording_means,
+          file.path(data_folder, "Cleaned_Recording_Means.csv"),
+          row.names = FALSE)
+write.csv(data,
+          file.path(data_folder, "Cleaned_Individual_Chirp_Gaps.csv"),
+          row.names = FALSE)
+
+# A wide, recording-level dataset that JASP can open directly.
+jasp_ready <- recording_means %>%
+  mutate(CricketID = as.character(CricketID)) %>%
+  select(RecordingID, CricketID, Temperature,
+         MeanGap_ms, MedianGap_ms, SDGap_ms, N_Gaps)
+write.csv(jasp_ready,
+          file.path(data_folder, "Gap_JASP_RecordingLevel.csv"),
+          row.names = FALSE)
+
+cat("\n--------------------------------------\n")
+cat("CLEANED DATA\n")
+cat("Valid recordings: ", nrow(recording_means), "\n", sep = "")
+cat("Individual crickets: ", n_distinct(recording_means$CricketID), "\n", sep = "")
+cat("Individual gaps: ", nrow(data), "\n", sep = "")
+cat("Excluded recordings: ", nrow(exclusion_table), "\n", sep = "")
+print(exclusion_table)
+
+# 7. MAIN ANALYSIS: LINEAR MIXED-EFFECTS MODEL ---------------
+# Temperature is the fixed predictor.
+# Cricket identity is a random intercept for repeat recordings.
+# Response: mean gap duration per recording (milliseconds).
+gap_lmm <- lmerTest::lmer(
+  MeanGap_ms ~ Temperature + (1 | CricketID),
+  data = recording_means,
+  REML = TRUE
+)
+
+cat("\n--------------------------------------\n")
+cat("LINEAR MIXED-EFFECTS MODEL (MAIN RESULT)\n")
+print(summary(gap_lmm))
+
+if (lme4::isSingular(gap_lmm)) {
+  warning("LMM has a singular fit: the estimated cricket variance is near zero.")
+}
+
+coef_table <- coef(summary(gap_lmm))
+if (!"Temperature" %in% rownames(coef_table)) {
+  stop("Temperature coefficient was not estimated.")
+}
+
+slope <- unname(coef_table["Temperature", "Estimate"])
+slope_se <- unname(coef_table["Temperature", "Std. Error"])
+slope_df <- unname(coef_table["Temperature", "df"])
+# Approximate 95% interval using Satterthwaite degrees of freedom.
+critical_t <- qt(0.975, df = slope_df)
+
+lmm_results <- data.frame(
+  Term = "Temperature",
+  N_Recordings = nrow(recording_means),
+  N_Crickets = n_distinct(recording_means$CricketID),
+  Slope_ms_per_C = slope,
+  StdError = slope_se,
+  DegreesFreedom = slope_df,
+  t_value = unname(coef_table["Temperature", "t value"]),
+  p_value = unname(coef_table["Temperature", "Pr(>|t|)"]),
+  CI95_Lower = slope - critical_t*slope_se,
+  CI95_Upper = slope + critical_t*slope_se,
+  SingularFit = lme4::isSingular(gap_lmm)
+)
+
+write.csv(lmm_results,
+          file.path(data_folder, "Gap_LMM_Results.csv"),
+          row.names = FALSE)
+
+# 8. OPTIONAL DESCRIPTIVE ORDINARY REGRESSION -----------------
+# This section is for comparison with your previous analysis.
+# Do NOT use this as your main inferential conclusion.
+ordinary_lm <- lm(MeanGap_ms ~ Temperature, data = recording_means)
+pearson <- cor.test(recording_means$Temperature,
+                    recording_means$MeanGap_ms, method = "pearson")
+cat("\nORDINARY REGRESSION (DESCRIPTIVE COMPARISON)\n")
+print(summary(ordinary_lm))
+cat("Pearson r: ", unname(pearson$estimate), "\n", sep = "")
+
+# 9. MODEL FITTED LINE + 95% CI ------------------------------
+# Prediction is the population-level fixed-effect line;
+# cricket-specific random offsets are not plotted here.
+# Bands represent uncertainty in the mean fixed-effect fit,
+# NOT a prediction interval for individual observations.
+predictions <- data.frame(
+  Temperature = seq(min(recording_means$Temperature),
+                    max(recording_means$Temperature), length.out = 200)
+)
+X <- model.matrix(~ Temperature, data = predictions)
+beta <- lme4::fixef(gap_lmm)
+V <- as.matrix(vcov(gap_lmm))
+predictions$Fitted_ms <- as.vector(X %*% beta)
+predictions$SE_Fitted <- sqrt(pmax(0, rowSums((X %*% V) * X)))
+predictions$Lower95 <- predictions$Fitted_ms - 1.96*predictions$SE_Fitted
+predictions$Upper95 <- predictions$Fitted_ms + 1.96*predictions$SE_Fitted
+write.csv(predictions,
+          file.path(data_folder, "Gap_LMM_Predictions.csv"),
+          row.names = FALSE)
+
+# 10. PLOT STYLES AND SHARED LMM LAYERS ----------------------
+point_colour <- "#245D87"
+individual_colour <- "#3478B8"
+mean_colour <- "#E07822"
+regression_colour <- "#26854B"
+confidence_colour <- "#A8D5AD"
+
+graph_theme <- theme_classic(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(size = 10, colour = "grey35"),
+    axis.title = element_text(size = 12),
+    panel.grid.major.y = element_line(colour = "grey90", linewidth = 0.3)
+  )
+
+lmm_ribbon <- geom_ribbon(
+  data = predictions,
+  aes(x = Temperature, ymin = Lower95, ymax = Upper95),
+  inherit.aes = FALSE,
+  fill = confidence_colour, alpha = 0.3
+)
+lmm_line <- geom_line(
+  data = predictions,
+  aes(x = Temperature, y = Fitted_ms),
+  inherit.aes = FALSE,
+  colour = regression_colour, linewidth = 1.1
+)
+
+# 11. FIGURE 1 - RECORDING MEANS WITH MIXED MODEL ------------
+plot1 <- ggplot() +
+  lmm_ribbon + lmm_line +
+  geom_point(
+    data = recording_means,
+    aes(x = Temperature, y = MeanGap_ms),
+    colour = point_colour, size = 2.5, alpha = 0.8
+  ) +
+  labs(
+    title = "Temperature vs. mean chirp gap",
+    subtitle = "One point per recording | Cricket random-intercept LMM with 95% CI",
+    x = "Recording temperature (\u00B0C)",
+    y = "Mean chirp gap (ms)"
+  ) + graph_theme
+
+print(plot1)
+ggsave(file.path(data_folder, "Figure1_MeanChirpGap_LMM.png"),
+       plot = plot1, width = 8, height = 5.5, dpi = 300, bg = "white")
+
+# 12. FIGURE 2 - ZOOMED AND FULL-RANGE INDIVIDUAL GAPS -------
+plot_individual_base <- ggplot() +
+  geom_point(
+    data = data,
+    aes(x = Temperature, y = ChirpGap_ms),
+    colour = individual_colour, alpha = 0.12, size = 0.8
+  ) +
+  lmm_ribbon + lmm_line +
+  geom_point(
+    data = recording_means,
+    aes(x = Temperature, y = MeanGap_ms),
+    colour = mean_colour, size = 2, alpha = 0.9
+  ) + graph_theme
+
+plot2a <- plot_individual_base +
+  coord_cartesian(ylim = c(0, 350)) +
+  labs(title = "Individual chirp gaps (zoomed)",
+       x = "Recording temperature (\u00B0C)", y = "Chirp gap (ms)")
+
+plot2b <- plot_individual_base +
+  labs(title = "Individual chirp gaps (full range)",
+       x = "Recording temperature (\u00B0C)", y = "Chirp gap (ms)")
+
+plot2 <- plot2a + plot2b +
+  plot_annotation(
+    title = "Temperature vs. inter-chirp gaps",
+    subtitle = paste(
+      "Blue: individual gaps | Orange: recording means |",
+      "Green: cricket random-intercept LMM"
+    )
+  )
+
+print(plot2)
+ggsave(file.path(data_folder, "Figure2_IndividualChirpGaps_LMM.png"),
+       plot = plot2, width = 13, height = 5.5, dpi = 300, bg = "white")
+
+# 13. FINAL SUMMARY ------------------------------------------
+cat("\n======================================\n")
+cat("CHIRP-GAP MIXED-MODEL ANALYSIS COMPLETE\n")
+cat("======================================\n")
+cat("N recordings: ", nrow(recording_means), "\n", sep = "")
+cat("N crickets: ", n_distinct(recording_means$CricketID), "\n", sep = "")
+cat("N individual gaps: ", nrow(data), "\n", sep = "")
+cat("Temperature slope (ms/deg C): ", round(slope, 4), "\n", sep = "")
+cat(sprintf("Temperature slope: %.2f \u00B1 %.2f ms/\u00B0C (SE)\n",
+            slope, slope_se))
+cat("95% CI: [", round(lmm_results$CI95_Lower, 4), ", ",
+    round(lmm_results$CI95_Upper, 4), "]\n", sep = "")
+cat("p-value: ", signif(lmm_results$p_value, 4), "\n", sep = "")
+cat("Singular fit: ", lmm_results$SingularFit, "\n", sep = "")
+cat("Output folder: ", data_folder, "\n", sep = "")
+cat("Done.\n")
